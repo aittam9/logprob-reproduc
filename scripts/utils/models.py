@@ -17,7 +17,7 @@ BASE_MODELS = {
 INSTRUCT_MODELS = { 
                 "Llama-3.2-1B-it":"meta-llama/Llama-3.2-1B-Instruct",
                 "Llama-3.2-3B-it":"meta-llama/Llama-3.2-3B-Instruct",
-                "Llama-3.2-7B-it":"meta-llama/Llama-3.2-7B-Instruct",
+                "Llama-3.1-8B-it":"meta-llama/Llama-3.1-8B-Instruct",
                 "Gemma-2-2B-it":"google/gemma-2-2B-it",
                 "Gemma-3-1B-it": "google/gemma-3-1B-it",
                 #"Mistral-3B-it": "mistralai/Ministral-3-3B-Instruct-2512",
