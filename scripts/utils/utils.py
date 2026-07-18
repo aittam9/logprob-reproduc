@@ -1,32 +1,109 @@
 import os
-import argparse
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm.auto import tqdm 
+import nnsight
+from nnsight import LanguageModel
 
 
-# helper to load models and tokenizers
-def load_model(model_name: str, device: str = None, cache_dir: str = None):
-	tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-	model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+# All access to model internals in this codebase goes through nnsight: model
+# loading returns an `nnsight.LanguageModel`, and `layer_logprobs` below reads
+# every layer's hidden state via nnsight's tracing API rather than manual
+# forward hooks. Passing `remote=True` runs the same trace on NDIF instead of
+# on local hardware -- see `configure_ndif`.
 
+
+def configure_ndif(api_key: str = None) -> None:
+	"""Point nnsight at NDIF for remote execution.
+
+	Reads `api_key`, falling back to the NDIF_API_KEY environment variable.
+	Request a key at https://login.ndif.us. Only needed when running with
+	--remote.
+	"""
+	api_key = api_key or os.environ.get("NDIF_API_KEY")
+	if not api_key:
+		raise ValueError(
+			"Remote execution requires an NDIF API key: set the NDIF_API_KEY "
+			"environment variable, or pass --ndif-api-key. Request one at "
+			"https://login.ndif.us."
+		)
+	nnsight.CONFIG.API.APIKEY = api_key
+
+
+def load_model(model_name: str, device: str = None, remote: bool = False) -> Tuple[LanguageModel, "PreTrainedTokenizer"]:
+	"""Load `model_name` as an nnsight `LanguageModel`.
+
+	With `remote=False` (default), the model is dispatched to `device`
+	(auto-detected as cuda if available) the first time it's traced. With
+	`remote=True`, weights are never downloaded or dispatched locally: the
+	forward pass runs on NDIF instead, so `device` is ignored.
+	"""
+	if remote:
+		model = LanguageModel(model_name)
+	else:
+		if device is None:
+			device = "cuda" if torch.cuda.is_available() else "cpu"
+		model = LanguageModel(model_name, device_map=device)
+
+	tokenizer = model.tokenizer
 	if tokenizer.pad_token is None:
 		tokenizer.pad_token = tokenizer.eos_token
 
-	if device is None:
-		device = "cuda" if torch.cuda.is_available() else "cpu"
-
-	model.to(device)
-	model.eval()
 	return model, tokenizer
 
 
-def read_blimp(file_path):  
+def layer_logprobs(
+	model: LanguageModel,
+	prefix_ids: List[int],
+	continuation_ids: List[int],
+	remote: bool = False,
+) -> List[Tuple[float, float]]:
+	"""Score `continuation_ids`, conditioned on `prefix_ids`, at every layer of
+	`model` via a logit-lens: the model's own output head applied directly to
+	each layer's hidden state.
+
+	This mirrors what `output_hidden_states=True` returns for a standard
+	transformers forward pass: entries for every decoder layer except the
+	last are the raw (pre-final-norm) residual stream, while the last entry
+	is already post-final-norm -- so applying the output head uniformly to
+	every entry gives an approximate logit lens for early layers and the
+	model's real output logits for the last one. nnsight's trace requests
+	the same `output_hidden_states=True` from the underlying model and reads
+	the result off `model.output.hidden_states`; with `remote=True` this runs
+	on NDIF and only the small per-layer scalars below are sent back, not the
+	hidden states themselves.
+
+	Returns a list of `(total_logprob, avg_logprob)` tuples, one per layer,
+	ordered from the earliest layer to the last.
+	"""
+	input_ids = torch.tensor([prefix_ids + continuation_ids])
+	# The first token of the sequence is never scored (there's no context to
+	# predict it from), so even an empty prefix behaves as if it had length 1.
+	prefix_len = max(len(prefix_ids), 1)
+
+	layer_scores = []
+	with model.trace(input_ids, output_hidden_states=True, remote=remote):
+		hidden_states = model.output.hidden_states
+		for hidden_state in hidden_states[1:]:
+			logits = model.lm_head(hidden_state)
+			shift_logits = logits[:, :-1, :]
+			shift_labels = input_ids[:, 1:]
+
+			cont_shift_logits = shift_logits[:, prefix_len - 1 :, :]
+			cont_shift_labels = shift_labels[:, prefix_len - 1 :]
+
+			token_logprobs = torch.log_softmax(cont_shift_logits, dim=-1).gather(
+				2, cont_shift_labels.unsqueeze(-1)
+			).squeeze(-1)
+
+			layer_scores.append((token_logprobs.sum().save(), token_logprobs.mean().save()))
+
+	return [(total.item(), avg.item()) for total, avg in layer_scores]
+
+
+def read_blimp(file_path):
     return pd.read_json(file_path, lines=True)[['sentence_good', 'sentence_bad','field', 'linguistics_term']]
 
 
@@ -126,5 +203,3 @@ def read_ewok(file_path):
 		})
 
 	raise ValueError(f"Could not interpret EWoK file columns: {list(df.columns)}")
-
-

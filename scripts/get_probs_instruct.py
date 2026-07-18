@@ -1,4 +1,4 @@
-"""Score pairs of sentences with an instruction-tuned Hugging Face causal LM.
+"""Score pairs of sentences with an instruction-tuned causal LM, layer by layer.
 
 Unlike `get_probs.py` (which feeds the bare sentence to the model, base-model
 style), this script wraps each sentence in the model's own chat template
@@ -12,8 +12,14 @@ on that instruction context:
 This is meant to be run on instruction-tuned models only (see
 `utils.models.INSTRUCT_MODELS`), so that they are evaluated the way they are
 actually used, rather than as if they were base models. Results are written
-to a separate output directory (`../results_instruct/` by default) so they
-don't overwrite the base-style runs in `../results/`.
+to a separate output directory (`results_instruct/` by default) so they
+don't overwrite the base-style runs in `results/`.
+
+Model internals are accessed through NNsight (https://nnsight.net): every
+forward pass runs inside an `nnsight.LanguageModel` trace, and layer
+activations are read off via `LanguageModel.output.hidden_states` rather
+than manual hooks. Pass `--remote` to run those traces on NDIF instead of
+locally (see `--help` and the README for the required API key).
 """
 
 import os
@@ -23,19 +29,17 @@ from pathlib import Path
 from typing import Tuple, List
 
 import pandas as pd
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm.auto import tqdm
 
 from utils.models import INSTRUCT_MODELS
 from utils.data_map import DATA_MAP, DATA_TYPE
-from utils.utils import read_ewok, load_model
+from utils.utils import read_blimp, read_ewok, load_model, layer_logprobs, configure_ndif
 
 
-DATA_PATH = "../data"
-BASE_OUTDIR = "../results_instruct/"
-TEST_OUTDIR = "../test_instruct/"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DATA_PATH = ROOT_DIR / "data"
+BASE_OUTDIR = ROOT_DIR / "results_instruct"
+TEST_OUTDIR = ROOT_DIR / "test_instruct"
 
 DEFAULT_INSTRUCTION = "Write a natural, coherent English sentence."
 
@@ -70,62 +74,29 @@ def build_instruction_prefix(tokenizer, instruction: str) -> List[int]:
 
 
 def sentence_logprobs_by_layer(
-	model, tokenizer, sentence: str, prefix_ids: List[int], device: str = None
+	model, tokenizer, sentence: str, prefix_ids: List[int], remote: bool = False
 ) -> list[SentenceScore]:
-	sentence_ids = tokenizer.encode(sentence, add_special_tokens=False)
-	input_ids = prefix_ids + sentence_ids
-	prefix_len = len(prefix_ids)
-
-	inputs = {
-		"input_ids": torch.tensor([input_ids], device=device),
-		"attention_mask": torch.ones((1, len(input_ids)), device=device, dtype=torch.long),
-	}
-
-	output_head = model.get_output_embeddings()
-	if output_head is None and hasattr(model, "lm_head"):
-		output_head = model.lm_head
-
-	with torch.no_grad():
-		outputs = model(**inputs, output_hidden_states=True, return_dict=True)
-
-	layer_scores = []
-	for hidden_state in outputs.hidden_states[1:]:
-		logits = output_head(hidden_state)
-		shift_logits = logits[:, :-1, :]
-		shift_labels = inputs["input_ids"][:, 1:]
-
-		# Only score the sentence tokens, conditioned on the instruction prefix:
-		# shift index (prefix_len - 1) predicts the first sentence token.
-		sent_shift_logits = shift_logits[:, prefix_len - 1:, :]
-		sent_shift_labels = shift_labels[:, prefix_len - 1:]
-
-		token_logprobs = torch.log_softmax(sent_shift_logits, dim=-1).gather(
-			2, sent_shift_labels.unsqueeze(-1)
-		).squeeze(-1)
-
-		total_logprob = token_logprobs.sum().item()
-		avg_logprob = token_logprobs.mean().item() if token_logprobs.numel() else float("nan")
-		layer_scores.append(SentenceScore(sentence, total_logprob, avg_logprob))
-
-	return layer_scores
+	continuation_ids = tokenizer.encode(sentence, add_special_tokens=False)
+	scores = layer_logprobs(model, prefix_ids, continuation_ids, remote=remote)
+	return [SentenceScore(sentence, total, avg) for total, avg in scores]
 
 
 def score_pair(
-	model, tokenizer, first: str, second: str, prefix_ids: List[int], device: str = None
+	model, tokenizer, first: str, second: str, prefix_ids: List[int], remote: bool = False
 ) -> Tuple[list[SentenceScore], list[SentenceScore]]:
-	first_scores = sentence_logprobs_by_layer(model, tokenizer, first, prefix_ids, device)
-	second_scores = sentence_logprobs_by_layer(model, tokenizer, second, prefix_ids, device)
+	first_scores = sentence_logprobs_by_layer(model, tokenizer, first, prefix_ids, remote=remote)
+	second_scores = sentence_logprobs_by_layer(model, tokenizer, second, prefix_ids, remote=remote)
 	return first_scores, second_scores
 
 
 def score_dataset(
 	model, tokenizer, data: pd.DataFrame, out_path: Path, label: str,
-	prefix_ids: List[int], instruction: str,
+	prefix_ids: List[int], instruction: str, remote: bool = False,
 ) -> None:
 	rows_by_layer = None
 	for row in tqdm(data.itertuples(), total=len(data)):
 		first_scores, second_scores = score_pair(
-			model, tokenizer, row.sentence_good, row.sentence_bad, prefix_ids, device=DEVICE
+			model, tokenizer, row.sentence_good, row.sentence_bad, prefix_ids, remote=remote
 		)
 		if rows_by_layer is None:
 			rows_by_layer = [[] for _ in range(len(first_scores))]
@@ -163,13 +134,9 @@ def score_dataset(
 		print(f"Layer {layer_index}: First sentence has higher logprob in {layer_accuracy:.2f}% of pairs")
 
 
-def read_blimp(file_path):
-	return pd.read_json(file_path, lines=True)[['sentence_good', 'sentence_bad', 'field', 'linguistics_term']]
-
-
 def main() -> None:
 	parser = argparse.ArgumentParser(
-		description="Score sentence pairs with an instruction-tuned causal LM, conditioned on a chat-template instruction."
+		description="Score sentence pairs with an instruction-tuned causal LM, conditioned on a chat-template instruction, via NNsight."
 	)
 	parser.add_argument("--data", required=True, help="Dataset key to score")
 	parser.add_argument("--model", required=True, choices=list(INSTRUCT_MODELS.keys()), help="Instruction-tuned model name")
@@ -180,13 +147,19 @@ def main() -> None:
 		default=DEFAULT_INSTRUCTION,
 		help="Instruction placed in the chat template's user turn before each sentence is scored as the assistant turn.",
 	)
+	parser.add_argument("--device", required=False, default=None, help="Device to load the model on (default: cuda if available, else cpu). Ignored with --remote.")
+	parser.add_argument("--remote", required=False, action="store_true", help="Run model traces on NDIF instead of locally; no local weights are downloaded.")
+	parser.add_argument("--ndif-api-key", required=False, default=None, help="NDIF API key for --remote; defaults to the NDIF_API_KEY environment variable.")
 	args = parser.parse_args()
+
+	if args.remote:
+		configure_ndif(args.ndif_api_key)
 
 	dtype = DATA_TYPE.get(args.data, "blimp")
 	model_id = INSTRUCT_MODELS[args.model]
 
-	print(f"Loading {model_id}...")
-	model, tokenizer = load_model(model_id, device=DEVICE)
+	print(f"Loading {model_id}{' (remote via NDIF)' if args.remote else ''}...")
+	model, tokenizer = load_model(model_id, device=args.device, remote=args.remote)
 
 	prefix_ids = build_instruction_prefix(tokenizer, args.instruction)
 	print(f"Instruction prefix ({len(prefix_ids)} tokens): {tokenizer.decode(prefix_ids)!r}")
@@ -195,16 +168,12 @@ def main() -> None:
 		if args.ewok_root:
 			ewok_root = Path(args.ewok_root)
 		else:
-			ewok_root = Path(__file__).resolve().parents[1] / "ewok-paper" / "output" / "dataset"
-			if not ewok_root.exists():
-				ewok_root = Path("../ewok-paper/output/dataset").resolve()
+			ewok_root = ROOT_DIR / "ewok-paper" / "output" / "dataset"
 
 		if not ewok_root.exists():
 			raise FileNotFoundError(f"EWoK output directory not found at {ewok_root}; place built EWoK outputs there or adjust path.")
 
 		testsuite_files = sorted(ewok_root.rglob("testsuite-*.csv"))
-		if not testsuite_files:
-			testsuite_files = sorted(ewok_root.glob("**/testsuite-*.csv"))
 		if not testsuite_files:
 			raise FileNotFoundError(f"No testsuite-*.csv files found under {ewok_root}")
 
@@ -215,20 +184,20 @@ def main() -> None:
 				data = data.head(10)
 
 			suite_name = testsuite_path.stem.replace("testsuite-", "")
-			out_path = Path(TEST_OUTDIR if args.test else BASE_OUTDIR) / args.model / f"ewok-{suite_name}"
+			out_path = (TEST_OUTDIR if args.test else BASE_OUTDIR) / args.model / f"ewok-{suite_name}"
 			os.makedirs(out_path, exist_ok=True)
-			score_dataset(model, tokenizer, data, out_path, f"ewok-{suite_name}", prefix_ids, args.instruction)
+			score_dataset(model, tokenizer, data, out_path, f"ewok-{suite_name}", prefix_ids, args.instruction, remote=args.remote)
 
 		return
 
-	data_path = Path(DATA_PATH) / DATA_MAP[args.data]
+	data_path = DATA_PATH / DATA_MAP[args.data]
 	data = read_blimp(data_path)
 	if args.test:
 		data = data.head(10)
 
-	out_path = Path(TEST_OUTDIR if args.test else BASE_OUTDIR) / args.model / args.data
+	out_path = (TEST_OUTDIR if args.test else BASE_OUTDIR) / args.model / args.data
 	os.makedirs(out_path, exist_ok=True)
-	score_dataset(model, tokenizer, data, out_path, args.data, prefix_ids, args.instruction)
+	score_dataset(model, tokenizer, data, out_path, args.data, prefix_ids, args.instruction, remote=args.remote)
 
 
 if __name__ == "__main__":

@@ -8,13 +8,17 @@ SCRIPT_DIR="$ROOT_DIR/scripts"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_get_probs.sh [test] [all_models|model <name>] [all_data|data <id>]
+  bash scripts/run_get_probs.sh [test] [all_models|model <name>] [all_data|data <id>] [remote]
+
+Pass "remote" to run model traces on NDIF instead of locally (requires the
+NDIF_API_KEY environment variable; see get_probs.py --help and the README).
 
 Examples:
   bash scripts/run_get_probs.sh all_models all_data
   bash scripts/run_get_probs.sh test all_models data 3
   bash scripts/run_get_probs.sh model Llama-3.2-1B all_data
   bash scripts/run_get_probs.sh all_models data 3
+  bash scripts/run_get_probs.sh model Llama-3.2-1B all_data remote
 EOF
 }
 
@@ -43,6 +47,10 @@ run_case() {
 
   if [[ "$RUN_TEST" -eq 1 ]]; then
     cmd+=(--test)
+  fi
+
+  if [[ "$RUN_REMOTE" -eq 1 ]]; then
+    cmd+=(--remote)
   fi
 
   if [[ "$RUN_TEST" -eq 1 ]]; then
@@ -74,6 +82,7 @@ contains_item() {
 }
 
 RUN_TEST=0
+RUN_REMOTE=0
 MODEL_MODE="all"
 DATA_MODE="all"
 MODEL_NAME=""
@@ -83,6 +92,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     test|--test)
       RUN_TEST=1
+      shift
+      ;;
+    remote|--remote)
+      RUN_REMOTE=1
       shift
       ;;
     all_models|all-models)

@@ -8,17 +8,22 @@ SCRIPT_DIR="$ROOT_DIR/scripts"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_get_probs_instruct.sh [test] [all_models|model <name>] [all_data|data <id>] [instruction "<text>"]
+  bash scripts/run_get_probs_instruct.sh [test] [all_models|model <name>] [all_data|data <id>] [instruction "<text>"] [remote]
 
 Runs scripts/get_probs_instruct.py, which only accepts instruction-tuned
 models and wraps each sentence in the model's chat template behind a fixed
-instruction before scoring it. Results go to ../results_instruct/.
+instruction before scoring it. Results go to results_instruct/.
+
+Pass "remote" to run model traces on NDIF instead of locally (requires the
+NDIF_API_KEY environment variable; see get_probs_instruct.py --help and the
+README).
 
 Examples:
   bash scripts/run_get_probs_instruct.sh all_models all_data
   bash scripts/run_get_probs_instruct.sh test all_models data 3
   bash scripts/run_get_probs_instruct.sh model Llama-3.2-1B-it all_data
   bash scripts/run_get_probs_instruct.sh all_models all_data instruction "Continue the story naturally."
+  bash scripts/run_get_probs_instruct.sh model Llama-3.2-1B-it all_data remote
 EOF
 }
 
@@ -53,6 +58,10 @@ run_case() {
     cmd+=(--instruction "$INSTRUCTION")
   fi
 
+  if [[ "$RUN_REMOTE" -eq 1 ]]; then
+    cmd+=(--remote)
+  fi
+
   if [[ "$RUN_TEST" -eq 1 ]]; then
     echo "Running model=${model_name} data=${data_name} test"
   else
@@ -82,6 +91,7 @@ contains_item() {
 }
 
 RUN_TEST=0
+RUN_REMOTE=0
 MODEL_MODE="all"
 DATA_MODE="all"
 MODEL_NAME=""
@@ -92,6 +102,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     test|--test)
       RUN_TEST=1
+      shift
+      ;;
+    remote|--remote)
+      RUN_REMOTE=1
       shift
       ;;
     all_models|all-models)

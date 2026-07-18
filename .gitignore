@@ -1,2 +1,21 @@
+# Data (not redistributed -- see Readme.md for how to obtain it)
 data/
+ewok-paper/
+
+# Run outputs
+results/
+results_instruct/
+test/
+test_instruct/
+*.err
+*.out
+
+# Analysis notebooks and their cached/rendered outputs
+notebooks/
+
+# Misc
+output*.png
+__pycache__/
+*.pyc
 .DS_Store
+.venv/
