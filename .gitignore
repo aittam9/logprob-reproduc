@@ -10,8 +10,12 @@ test_instruct/
 *.err
 *.out
 
-# Analysis notebooks and their cached/rendered outputs
-notebooks/
+# Analysis notebooks: keep the notebook itself and the caches it reads from,
+# ignore everything else generated while exploring (extra caches, figures/)
+notebooks/*
+!notebooks/base_vs_instruct_layers.ipynb
+!notebooks/category_acc_cache.csv
+!notebooks/layer_acc_cache.csv
 
 # Misc
 output*.png
